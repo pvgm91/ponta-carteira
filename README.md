@@ -28,13 +28,36 @@ Cada geração troca todos os acessos de uma vez: quem não estiver na lista dei
 
 - Os dados dos clientes (contratos, valores, provas) ficam cifrados com AES-256 dentro do `index.html`. Sem um usuário e senha válidos, eles não podem ser lidos, nem olhando o código do site.
 - Cada senha passa por 250 mil rodadas de PBKDF2, o que torna lenta a tentativa de adivinhar senhas. Use senhas longas.
-- **Limites:** é um site sem servidor. Não há bloqueio por tentativas, registro de acessos nem permissões diferentes por pessoa: quem entra vê tudo.
+- **Limites:** é um site sem servidor próprio. Não há bloqueio por tentativas, registro de acessos nem permissões diferentes por pessoa: quem entra vê tudo.
 - **Versões antigas continuam no histórico do Git.** Se um acesso precisar ser cortado com urgência, gere um novo `index.html` e também apague o histórico (ou crie um repositório novo), porque o arquivo antigo ainda abre com a senha antiga.
 - O mapa usa a biblioteca D3 (cdnjs) e a fonte Sora (Google Fonts), carregadas da internet. Nenhum dado de cliente é enviado para fora.
 
-## Onde ficam as alterações
+## Onde ficam as alterações (compartilhadas com a equipe)
 
-Trocas de carteira, cidades corrigidas, roteiros, passagens e configurações ficam salvas **no navegador de cada pessoa**. Para guardar ou compartilhar, use **Configurações → Backup dos dados → Exportar meus dados**; quem recebe o arquivo usa **Importar dados**.
+Trocas de carteira, cidades corrigidas, roteiros, passagens e configurações ficam no arquivo `dados/carteira.enc.json`, no branch **dados** deste repositório. O arquivo é cifrado com a mesma chave do login: no GitHub ninguém consegue ler o conteúdo. Ele fica fora do branch `main` para que cada salvamento não publique o site de novo.
+
+- **Quem só consulta:** entra com usuário e senha e já vê a versão da equipe. As alterações dessa pessoa ficam só no navegador dela.
+- **Quem salva para todos:** cola um token do GitHub uma vez. Para isso, clique no status no topo da tela (ao lado de "Sair"). A partir daí, cada alteração é enviada sozinha em poucos segundos, e a tela busca as alterações dos outros a cada minuto e quando a aba volta a ficar ativa.
+- **Duas pessoas ao mesmo tempo:** cada envio junta as alterações por cliente e por roteiro, então uma pessoa não apaga o que a outra fez. Se duas pessoas mexem no mesmo cliente, vale o último envio.
+- **Histórico:** cada salvamento é um commit em `https://github.com/pvgm91/ponta-carteira/commits/dados`, e dá para voltar uma versão antiga por ali.
+
+### Token
+
+Em github.com, abra **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**:
+
+- **Repository access:** Only select repositories → `ponta-carteira`
+- **Permissions → Repository permissions → Contents:** Read and write (só isso)
+- Defina a validade e copie o token na hora.
+
+Um token fine-grained só enxerga repositórios da própria conta, então quem não é dono do repositório não consegue gerar um token para ele. Nesse caso, o dono gera o token e passa por um canal privado. Quem tem o token pode alterar qualquer arquivo do repositório. O token fica guardado só no navegador de quem colou, e **Esquecer token** apaga.
+
+### Depois de gerar acessos novos
+
+Se o `gerador-de-acesso.html` criar uma chave nova, a versão da equipe deixa de abrir com o `index.html` novo, e o status fica vermelho. Antes de gerar acessos, alguém deve **exportar o backup**. Depois de publicar o `index.html` novo, essa pessoa importa o backup e usa **Substituir a da equipe pela minha**. O gerador também precisa receber esta versão do código, senão o compartilhamento some no próximo `index.html` gerado.
+
+### Backup
+
+Em **Configurações → Backup dos dados**, **Exportar meus dados** gera um JSON (nunca suba esse arquivo, porque ele não é cifrado). **Importar dados** substitui a versão da equipe quando há token, ou só a deste navegador quando não há.
 
 "Mantenha-me conectado" guarda a sessão no navegador. Em computador compartilhado, deixe desmarcado e use **Sair**.
 

@@ -59,6 +59,8 @@ button{cursor:pointer}
 .sync i{width:8px;height:8px;border-radius:50%;background:#9D9D9C;display:inline-block}
 .sync.cloud i{background:var(--vm)}
 .sync.local i{background:var(--lar)}
+.sync.pend i{background:#F1C100}
+.sync.err i{background:#E5484D}
 
 .view{display:none;flex:1;min-height:0}
 .view.on{display:flex}
@@ -529,7 +531,7 @@ const Store = {
     this.loadLocal(); applyOverrides(); renderAll();
     let db=null;
     try{ if(window.claude && window.claude.use) db = await window.claude.use('db'); }catch(e){ db=null; }
-    if(!db){ setSync('local'); return; }
+    if(!db){ Sync.start(); return; }
     this.db=db; this.mode='cloud'; setSync('cloud');
     try{ const user = await window.claude.use('user'); if(user && user.can){ const w = await user.can('data.write'); if(w===false){ this.canWrite=false; setSync('read'); } } }catch(e){}
     const onErr = e => { if(e && e.code==='revoked'){ this.db=null; this.mode='local'; setSync('local'); } };
@@ -540,7 +542,8 @@ const Store = {
   },
   async write(path,data){
     this.saveLocal();
-    if(!this.db || !this.canWrite) return;
+    if(!this.db){ Sync.marcar(path,'set'); return; }
+    if(!this.canWrite) return;
     try{ await this.db.doc(path).set(data); }
     catch(e){ if(e && e.code==='invalid_argument'){ this.canWrite=false; setSync('read'); toast('Você não tem permissão para salvar na versão compartilhada. Alterações ficam só neste navegador.'); }
       else if(e && e.code==='unavailable'){ setTimeout(()=>{ this.db && this.db.doc(path).set(data).catch(()=>{}); }, 800+Math.random()*800); }
@@ -548,7 +551,8 @@ const Store = {
   },
   async remove(path){
     this.saveLocal();
-    if(!this.db || !this.canWrite) return;
+    if(!this.db){ Sync.marcar(path,'del'); return; }
+    if(!this.canWrite) return;
     try{ await this.db.doc(path).delete(); }catch(e){ toast('Não foi possível excluir agora.'); }
   }
 };
@@ -563,6 +567,226 @@ const saveFares = debounce(()=>Store.write('app/fares',{fares:S.fares,extraDest:
 function saveOverride(id){ const o=S.overrides[id]||{}; Store.write('overrides/'+id, o); }
 function saveRoteiro(r){ S.roteiros[r.id]=r; Store.write('roteiros/'+r.id, r); }
 function deleteRoteiro(id){ delete S.roteiros[id]; Store.remove('roteiros/'+id); }
+
+/* =====================================================================
+   COMPARTILHAMENTO PELO GITHUB
+   Os dados da equipe ficam em dados/carteira.enc.json, no branch "dados"
+   do repositório, cifrados com a mesma chave que protege os clientes.
+   Ler: qualquer pessoa logada. Gravar: quem colou um token com Contents: Read and write.
+   ===================================================================== */
+const GH = {owner:'pvgm91', repo:'ponta-carteira', branch:'dados', base:'main', path:'dados/carteira.enc.json'};
+const GH_TOKEN_KEY='ponta-carteira-gh-token', GH_STATE_KEY='ponta-carteira-gh-pendente';
+let DATA_KEY=null;
+const ghB64=txt=>b64e(te.encode(txt));
+const ghUnB64=b64=>td.decode(b64d(String(b64).replace(/\s/g,'')));
+const Sync = {
+  token:'', sha:null, quando:null, dirty:{}, full:false, busy:false, again:false, timer:null, lastPull:0, keyErr:false, erro:'', started:false,
+  loadPrefs(){
+    try{ this.token=localStorage.getItem(GH_TOKEN_KEY)||''; }catch(e){}
+    let raw=null; try{ raw=localStorage.getItem(GH_STATE_KEY); }catch(e){}
+    if(raw===null){
+      /* primeira vez com o compartilhamento: o que já estava neste navegador entra como alteração a enviar */
+      Object.keys(S.overrides||{}).forEach(id=>this.dirty['overrides/'+id]='set');
+      Object.keys(S.roteiros||{}).forEach(id=>this.dirty['roteiros/'+id]='set');
+      this.savePrefs(); return;
+    }
+    try{ const d=JSON.parse(raw)||{}; this.dirty=d.dirty||{}; this.full=!!d.full; this.sha=d.sha||null; this.quando=d.quando||null; }catch(e){}
+  },
+  savePrefs(){ try{ localStorage.setItem(GH_STATE_KEY, JSON.stringify({dirty:this.dirty,full:this.full,sha:this.sha,quando:this.quando})); }catch(e){} },
+  pendentes(){ return this.full?1:Object.keys(this.dirty).length; },
+  headers(){ const h={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}; if(this.token) h.Authorization='Bearer '+this.token; return h; },
+  api(p){ return `https://api.github.com/repos/${GH.owner}/${GH.repo}/${p}`; },
+  async erroHttp(r,acao){
+    if(r.status===401) return new Error(this.token?'O GitHub não reconheceu o token. Gere outro e cole inteiro.':'O GitHub recusou o acesso (401).');
+    if(r.status===403||r.status===429){
+      if(r.headers.get('x-ratelimit-remaining')==='0') return new Error('Limite de consultas do GitHub atingido. Tento de novo em alguns minutos.');
+      return new Error(this.token?'O token não tem permissão de escrita neste repositório (Contents: Read and write).':'O GitHub recusou o acesso (403).');
+    }
+    const t=await r.text().catch(()=>''); return new Error(`GitHub respondeu ${r.status} ao ${acao}: ${t.slice(0,120)}`);
+  },
+  async cifrar(obj){
+    const key=await crypto.subtle.importKey('raw',DATA_KEY,'AES-GCM',false,['encrypt']);
+    const iv=crypto.getRandomValues(new Uint8Array(12));
+    const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,te.encode(JSON.stringify(obj))));
+    return JSON.stringify({app:'ponta-carteira-dados',v:1,em:new Date().toISOString(),iv:b64e(iv),ct:b64e(ct)});
+  },
+  async decifrar(txt){
+    const env=JSON.parse(txt);
+    const key=await crypto.subtle.importKey('raw',DATA_KEY,'AES-GCM',false,['decrypt']);
+    const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64d(env.iv)},key,b64d(env.ct));
+    return JSON.parse(td.decode(pt));
+  },
+  /* {sha, dados} | {sha, dados:null, keyErr:true} | null (ainda não existe) */
+  async buscar(){
+    const r=await fetch(this.api(`contents/${GH.path}?ref=${GH.branch}&_=${Date.now()}`),{headers:this.headers(),cache:'no-store'});
+    if(r.status===404) return null;
+    if(!r.ok) throw await this.erroHttp(r,'buscar os dados');
+    const arq=await r.json();
+    let txt=arq.content?ghUnB64(arq.content):'';
+    if(!txt && arq.download_url){ const d=await fetch(arq.download_url+'?_='+Date.now(),{cache:'no-store'}); txt=await d.text(); }
+    try{ return {sha:arq.sha, dados:await this.decifrar(txt)}; }
+    catch(e){ return {sha:arq.sha, dados:null, keyErr:true}; }
+  },
+  async garantirBranch(){
+    const r=await fetch(this.api(`git/ref/heads/${GH.branch}`),{headers:this.headers(),cache:'no-store'});
+    if(r.ok) return;
+    if(r.status!==404) throw await this.erroHttp(r,'conferir o branch de dados');
+    const m=await fetch(this.api(`git/ref/heads/${GH.base}`),{headers:this.headers(),cache:'no-store'});
+    if(!m.ok) throw await this.erroHttp(m,'ler o branch principal');
+    const sha=(await m.json()).object.sha;
+    const c=await fetch(this.api('git/refs'),{method:'POST',headers:{...this.headers(),'Content-Type':'application/json'},body:JSON.stringify({ref:'refs/heads/'+GH.branch,sha})});
+    if(!c.ok && c.status!==422) throw await this.erroHttp(c,'criar o branch de dados');
+  },
+  foto(){ return JSON.parse(JSON.stringify({overrides:S.overrides,roteiros:S.roteiros,cfg:S.cfg,fares:S.fares,extraDest:S.extraDest})); },
+  /* aplica sobre "alvo" as alterações locais ainda não enviadas */
+  sobrepor(alvo,local,dirty){
+    alvo.overrides=alvo.overrides||{}; alvo.roteiros=alvo.roteiros||{};
+    Object.keys(dirty).forEach(p=>{
+      const op=dirty[p], i=p.indexOf('/'), tipo=p.slice(0,i), id=p.slice(i+1);
+      if(p==='app/config'){ alvo.cfg=local.cfg; return; }
+      if(p==='app/fares'){ alvo.fares=local.fares; alvo.extraDest=local.extraDest; return; }
+      if(tipo==='overrides'||tipo==='roteiros'){
+        if(op==='del'||local[tipo][id]===undefined) delete alvo[tipo][id]; else alvo[tipo][id]=local[tipo][id];
+      }
+    });
+    return alvo;
+  },
+  usar(d){
+    S.overrides=d.overrides||{}; S.roteiros=d.roteiros||{};
+    S.cfg={...CFG_DEFAULT,...(d.cfg||{})}; S.fares=mergeFares(d.fares||{}); S.extraDest=d.extraDest||[];
+    Store.saveLocal(); applyOverrides(); refresh();
+  },
+  status(){
+    if(Store.mode==='cloud') return;
+    const el=$('#sync'); if(!el) return;
+    const n=this.pendentes(); let cls='sync ', txt;
+    if(this.busy){ cls+='pend'; txt='Sincronizando com a equipe…'; }
+    else if(this.erro){ cls+='err'; txt=this.erro; }
+    else if(this.keyErr){ cls+='err'; txt='Versão da equipe gravada com outros acessos'; }
+    else if(!this.token){ cls+='local'; txt=n?`${n} alteração(ões) só neste navegador`:'Lendo a versão da equipe'; }
+    else if(n){ cls+='pend'; txt='Alterações ainda não enviadas'; }
+    else { cls+='cloud'; txt='Salvo e compartilhado com a equipe'; }
+    el.className=cls; el.querySelector('span').textContent=txt;
+    el.title=txt+' · clique para ver o compartilhamento';
+  },
+  marcar(path,op){
+    this.dirty[path]=op; this.savePrefs(); this.status();
+    if(this.token){ clearTimeout(this.timer); this.timer=setTimeout(()=>this.enviar(),2500); }
+  },
+  substituirTudo(){ this.full=true; this.dirty={}; this.savePrefs(); this.status(); if(this.token) this.enviar(); },
+  async puxar(silencioso){
+    if(this.busy){ return; }
+    this.busy=true; this.lastPull=Date.now();
+    try{
+      const rem=await this.buscar(); this.erro='';
+      if(!rem){ this.keyErr=false; if(this.token){ this.full=true; this.savePrefs(); } }
+      else if(rem.keyErr){ this.keyErr=true; }
+      else {
+        this.keyErr=false;
+        if(rem.sha!==this.sha || this.pendentes()){
+          const local=this.foto();
+          const alvo=this.full?local:this.sobrepor(rem.dados,local,this.dirty);
+          this.usar(alvo);
+        }
+        this.sha=rem.sha; this.quando=Date.now(); this.savePrefs();
+      }
+      if(!silencioso) toast(rem?(rem.keyErr?'A versão da equipe não abre com estes acessos.':'Versão da equipe carregada.'):'Ainda não há versão da equipe no GitHub.');
+    }catch(e){ this.erro=e.message; if(!silencioso) toast(e.message); }
+    finally{ this.busy=false; this.status(); }
+    if(this.token && this.pendentes() && !this.keyErr) await this.enviar();
+  },
+  async enviar(forcar){
+    if(!this.token){ this.status(); return false; }
+    if(this.busy){ this.again=true; return false; }
+    clearTimeout(this.timer); this.busy=true; this.status();
+    let ok=false;
+    try{
+      for(let tent=0; tent<4 && !ok; tent++){
+        const rem=await this.buscar();
+        if(rem && rem.keyErr && !forcar){
+          this.keyErr=true;
+          throw new Error('A versão da equipe foi gravada com outros acessos. Abra o compartilhamento para decidir.');
+        }
+        if(!rem) await this.garantirBranch();
+        const dirty={...this.dirty}, full=this.full, local=this.foto();
+        const alvo=(full||!rem||!rem.dados)?local:this.sobrepor(rem.dados,local,dirty);
+        const corpo={message:'carteira: atualização pelo app',content:ghB64(await this.cifrar(alvo)),branch:GH.branch};
+        if(rem) corpo.sha=rem.sha;
+        const r=await fetch(this.api('contents/'+GH.path),{method:'PUT',headers:{...this.headers(),'Content-Type':'application/json'},body:JSON.stringify(corpo)});
+        if(r.status===409||r.status===422){ await new Promise(s=>setTimeout(s,600+Math.random()*900)); continue; }
+        if(!r.ok) throw await this.erroHttp(r,'salvar');
+        const resp=await r.json();
+        /* o que mudou durante o envio continua pendente */
+        Object.keys(dirty).forEach(k=>{ if(this.dirty[k]===dirty[k]) delete this.dirty[k]; });
+        if(full) this.full=false;
+        this.usar(this.sobrepor(JSON.parse(JSON.stringify(alvo)),this.foto(),this.dirty));
+        this.sha=resp.content.sha; this.quando=Date.now(); this.keyErr=false; this.erro=''; this.savePrefs(); ok=true;
+      }
+      if(!ok) throw new Error('Outra pessoa estava salvando ao mesmo tempo. Tento de novo em instantes.');
+    }catch(e){
+      this.erro=e.message;
+      if(e instanceof TypeError||/mesmo tempo|Limite/.test(e.message)){ clearTimeout(this.timer); this.timer=setTimeout(()=>{ this.erro=''; this.enviar(); },30000); }
+    }
+    finally{ this.busy=false; this.status(); }
+    if(this.again){ this.again=false; if(this.pendentes()) this.enviar(); }
+    return ok;
+  },
+  async testar(log){
+    if(!this.token){ log('Cole o token no campo acima.',true); return; }
+    try{
+      log('Identificando o token…');
+      const u=await fetch('https://api.github.com/user',{headers:this.headers(),cache:'no-store'});
+      if(u.status===401){ log('O GitHub não reconheceu este token (401). Gere outro e cole inteiro.',true); return; }
+      if(!u.ok){ log('GitHub respondeu '+u.status+' ao identificar o token.',true); return; }
+      const conta=(await u.json()).login;
+      log(`Token da conta ${conta}. Testando escrita…`);
+      await this.garantirBranch();
+      const alvo=`dados/.teste-${Date.now()}.txt`;
+      const put=await fetch(this.api('contents/'+alvo),{method:'PUT',headers:{...this.headers(),'Content-Type':'application/json'},body:JSON.stringify({message:'teste de permissão do token',content:ghB64('ok'),branch:GH.branch})});
+      if(put.status===403||put.status===404){ log(`O token lê, mas não grava em ${GH.owner}/${GH.repo}. Confira: Repository access → Only select repositories → ${GH.repo}, e Permissions → Contents: Read and write.`,true); return; }
+      if(!put.ok){ log('GitHub respondeu '+put.status+' no teste de escrita.',true); return; }
+      const criado=await put.json();
+      await fetch(this.api('contents/'+alvo),{method:'DELETE',headers:{...this.headers(),'Content-Type':'application/json'},body:JSON.stringify({message:'remove teste',sha:criado.content.sha,branch:GH.branch})}).catch(()=>{});
+      log(`Tudo certo: o token da conta ${conta} consegue salvar para a equipe.`);
+    }catch(e){ log(e.message,true); }
+  },
+  abrir(){
+    const q=this.quando?new Date(this.quando).toLocaleString('pt-BR'):'nunca';
+    openModal(`<div class="mh"><span class="h2">Compartilhar com a equipe</span></div>
+    <div class="mb" style="display:flex;flex-direction:column;gap:12px">
+      <div class="small">Os dados da equipe ficam no GitHub (<b>${GH.owner}/${GH.repo}</b>), cifrados com a mesma chave do login. Todo mundo que entra vê a mesma versão. Para <b>salvar</b> para todos, cole um token do GitHub uma vez neste navegador.</div>
+      ${this.keyErr?`<div class="note" style="border-color:#E5484D">A versão salva no GitHub foi cifrada com outros acessos (o index.html foi gerado de novo). Ela não abre aqui. Se você tem a versão certa neste navegador, use <b>Substituir a da equipe pela minha</b>.</div>`:''}
+      <label class="small" for="ghTok"><b>Token de acesso</b> (fine-grained, só este repositório, Contents: Read and write)</label>
+      <div style="display:flex;gap:8px"><input class="input" type="password" id="ghTok" placeholder="github_pat_..." autocomplete="off" spellcheck="false" value="${esc(this.token)}"><button class="btn" id="ghOlho" type="button">Mostrar</button></div>
+      <div class="small muted">O token fica guardado só neste navegador. Não vai para o GitHub, nem para o backup. Última sincronização: ${q}. Alterações pendentes: ${this.pendentes()}.</div>
+      <div class="note" id="ghLog" style="min-height:1em">${esc(this.erro||'')}</div>
+    </div>
+    <div class="mf" style="flex-wrap:wrap">
+      <button class="btn" id="ghEsq">Esquecer token</button><button class="btn" id="ghTest">Testar token</button>
+      ${this.keyErr&&this.token?'<button class="btn" id="ghForce">Substituir a da equipe pela minha</button>':''}
+      <span style="flex:1"></span>
+      <button class="btn" id="ghPull">Buscar agora</button><button class="btn primary" id="ghSave">Salvar</button>
+    </div>`);
+    const log=(t,err)=>{ const el=$('#ghLog'); if(el){ el.textContent=t; el.style.color=err?'#E5484D':''; } };
+    const ler=()=>{ const v=$('#ghTok').value.trim(); if(v!==this.token){ this.token=v; try{ v?localStorage.setItem(GH_TOKEN_KEY,v):localStorage.removeItem(GH_TOKEN_KEY); }catch(e){} } };
+    $('#ghOlho').onclick=()=>{ const i=$('#ghTok'); const s=i.type==='password'; i.type=s?'text':'password'; $('#ghOlho').textContent=s?'Ocultar':'Mostrar'; };
+    $('#ghEsq').onclick=()=>{ $('#ghTok').value=''; ler(); this.status(); log('Token apagado deste navegador.'); };
+    $('#ghTest').onclick=async()=>{ ler(); await this.testar(log); };
+    $('#ghPull').onclick=async()=>{ ler(); log('Buscando…'); await this.puxar(true); log(this.erro||(this.keyErr?'A versão da equipe não abre com estes acessos.':'Versão da equipe carregada.'),!!this.erro||this.keyErr); };
+    $('#ghSave').onclick=async()=>{ ler(); if(!this.token){ log('Sem token, as alterações ficam só neste navegador.',true); return; } log('Salvando…'); const ok=await this.enviar(); log(ok?'Salvo. Todo mundo já vê esta versão.':(this.erro||'Não foi possível salvar.'),!ok); };
+    const f=$('#ghForce'); if(f) f.onclick=async()=>{ if(!confirm('Substituir a versão da equipe pela deste navegador? A versão atual do GitHub fica só no histórico.')) return; this.full=true; this.savePrefs(); log('Salvando…'); const ok=await this.enviar(true); log(ok?'Versão da equipe substituída.':(this.erro||'Não foi possível salvar.'),!ok); };
+  },
+  start(){
+    if(this.started) return; this.started=true;
+    this.loadPrefs(); this.status();
+    const el=$('#sync'); el.style.cursor='pointer'; el.setAttribute('role','button'); el.tabIndex=0;
+    el.onclick=()=>this.abrir(); el.onkeydown=e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); this.abrir(); } };
+    this.puxar(true);
+    const talvez=()=>{ if(document.visibilityState!=='visible'||this.busy) return; if(Date.now()-this.lastPull>(this.token?40000:180000)) this.puxar(true); };
+    setInterval(talvez,20000);
+    document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible' && Date.now()-this.lastPull>15000) this.puxar(true); });
+  }
+};
 
 let refreshPending=false;
 function refresh(){ if(refreshPending) return; refreshPending=true; requestAnimationFrame(()=>{ refreshPending=false; renderAll(); }); }
@@ -1303,7 +1527,7 @@ function renderConfig(){
      </div>
    </div>
    <div class="card cfg-card"><span class="h3">Backup dos dados</span>
-     <div class="small muted">As alterações (carteiras, cidades, roteiros, passagens e configurações) ficam salvas neste navegador. Exporte para guardar uma cópia ou passar para outra pessoa da equipe, que importa no navegador dela.</div>
+     <div class="small muted">As alterações (carteiras, cidades, roteiros, passagens e configurações) são compartilhadas com a equipe pelo GitHub quando há um token salvo neste navegador (clique no status no topo). Exporte para guardar uma cópia de segurança.</div>
      <div class="actions"><button class="btn" id="bkexp">Exportar meus dados</button><label class="btn" style="cursor:pointer">Importar dados<input type="file" id="bkimp" accept="application/json,.json" hidden></label></div>
    </div>
    <div class="note">Como o custo é calculado: o trajeto liga a base ou o aeroporto de chegada a todos os clientes e volta, pelo menor caminho. Os dias saem de horas de estrada mais horas de visita, divididas pela jornada. Hotel = dias − 1 diárias. Alimentação = dias × pessoas × valor por dia. Combustível e pedágio usam os quilômetros de estrada.</div>`;
@@ -1312,8 +1536,8 @@ function renderConfig(){
   $('#cf_cd').onchange=e=>{ S.cfg.carroDireto=e.target.value; saveCfg(); };
   $('#bkexp').onclick=()=>{ save('ponta_carteira_backup_'+new Date().toISOString().slice(0,10)+'.json', JSON.stringify({app:'ponta-carteira',v:1,em:new Date().toISOString(),overrides:S.overrides,roteiros:S.roteiros,cfg:S.cfg,fares:S.fares,extraDest:S.extraDest},null,1)); };
   $('#bkimp').onchange=async e=>{ const f=e.target.files[0]; if(!f) return; try{ const d=JSON.parse(await f.text()); if(d.app!=='ponta-carteira') throw 0;
-      openModal(`<div class="mh"><span class="h2">Importar dados</span></div><div class="mb">Substituir as alterações deste navegador pelas do arquivo <b>${esc(f.name)}</b>? São ${Object.keys(d.roteiros||{}).length} roteiros e ${Object.keys(d.overrides||{}).length} clientes ajustados.</div><div class="mf"><button class="btn" data-close>Cancelar</button><button class="btn primary" id="mok">Importar</button></div>`);
-      $('#mok').onclick=()=>{ S.overrides=d.overrides||{}; S.roteiros=d.roteiros||{}; S.cfg={...CFG_DEFAULT,...(d.cfg||{})}; S.fares=mergeFares(d.fares||{}); S.extraDest=d.extraDest||[]; Store.saveLocal(); applyOverrides(); closeModal(); renderAll(); toast('Dados importados.'); };
+      openModal(`<div class="mh"><span class="h2">Importar dados</span></div><div class="mb">Substituir os dados ${Sync.token?'<b>da equipe</b>':'deste navegador'} pelos do arquivo <b>${esc(f.name)}</b>? São ${Object.keys(d.roteiros||{}).length} roteiros e ${Object.keys(d.overrides||{}).length} clientes ajustados.</div><div class="mf"><button class="btn" data-close>Cancelar</button><button class="btn primary" id="mok">Importar</button></div>`);
+      $('#mok').onclick=()=>{ S.overrides=d.overrides||{}; S.roteiros=d.roteiros||{}; S.cfg={...CFG_DEFAULT,...(d.cfg||{})}; S.fares=mergeFares(d.fares||{}); S.extraDest=d.extraDest||[]; Store.saveLocal(); if(Store.mode!=='cloud') Sync.substituirTudo(); applyOverrides(); closeModal(); renderAll(); toast('Dados importados.'); };
     }catch(err){ toast('Arquivo inválido. Use um backup exportado por esta ferramenta.'); } e.target.value=''; };
   $('#cfreset').onclick=()=>{ S.cfg={...CFG_DEFAULT}; saveCfg(); renderConfig(); toast('Padrões restaurados.'); };
 }
@@ -1378,8 +1602,8 @@ async function tryLogin(u,p){
   try{ const kek=await deriveKek(u,p,b64d(rec.salt)); const raw=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:b64d(rec.iv)},kek,b64d(rec.wk))); const data=await openData(raw); return {raw,data}; }catch(e){ return null; }
 }
 const SK='ponta-carteira-sessao';
-async function startApp(data){
-  BASE_CLIENTS=data; $('#login').classList.add('hide'); $('#app').hidden=false;
+async function startApp(data,raw){
+  DATA_KEY=raw; BASE_CLIENTS=data; $('#login').classList.add('hide'); $('#app').hidden=false;
   if(typeof d3==='undefined'){ $('#app').innerHTML='<div class="empty" style="padding:60px">Não foi possível carregar a biblioteca do mapa. Verifique a internet e recarregue a página.</div>'; return; }
   applyOverrides(); await Store.init();
 }
@@ -1394,13 +1618,13 @@ $('#loginForm').onsubmit=async e=>{
   if(!r){ $('#lerr').textContent='Usuário ou senha inválidos.'; $('#lp').value=''; $('#lp').focus(); return; }
   const sess=JSON.stringify({k:b64e(r.raw),u:normUser(u),v:VAULT.iv});
   try{ sessionStorage.setItem(SK,sess); if($('#lkeep').checked) localStorage.setItem(SK,sess); else localStorage.removeItem(SK); }catch(err){}
-  $('#lp').value=''; startApp(r.data);
+  $('#lp').value=''; startApp(r.data,r.raw);
 };
 $('#logout').onclick=()=>{ try{ sessionStorage.removeItem(SK); localStorage.removeItem(SK); }catch(e){} location.reload(); };
 (async function boot(){
   const fy=document.querySelector('.login .foot'); fy.textContent=`© ${new Date().getFullYear()} Ponta. Todos os direitos reservados.`;
   let sess=null; try{ sess=JSON.parse(sessionStorage.getItem(SK)||localStorage.getItem(SK)||'null'); }catch(e){}
-  if(sess && sess.v===VAULT.iv){ try{ const data=await openData(b64d(sess.k)); await startApp(data); return; }catch(e){} }
+  if(sess && sess.v===VAULT.iv){ try{ const raw=b64d(sess.k); const data=await openData(raw); await startApp(data,raw); return; }catch(e){} }
   try{ sessionStorage.removeItem(SK); localStorage.removeItem(SK); }catch(e){}
   $('#lu').focus();
 })();
