@@ -1,0 +1,5 @@
+# Nunca subir: contém os dados dos clientes sem proteção
+gerador-de-acesso.html
+# Backups exportados pela ferramenta
+ponta_carteira_backup_*.json
+*.csv
